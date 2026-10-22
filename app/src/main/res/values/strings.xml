@@ -1,0 +1,23 @@
+<resources>
+    <string name="app_name">HandBrake Mobile</string>
+    <string name="app_subtitle">استوديو ضغط وتحويل صيغ الفيديو فائق السرعة</string>
+    <string name="open_source_video">اختيار فيديو من الجهاز</string>
+    <string name="generate_sample_video">توليد فيديو تجريبي حقيقي (HD MP4)</string>
+    <string name="start_encode">بدء الضغط والتحويل الآن</string>
+    <string name="add_to_queue">إضافة إلى الطابور</string>
+    <string name="presets_title">الإعدادات المسبقة (Presets)</string>
+    <string name="tab_summary">الملخص</string>
+    <string name="tab_dimensions">الأبعاد والقص</string>
+    <string name="tab_filters">الفلاتر</string>
+    <string name="tab_video">الفيديو والترميز</string>
+    <string name="tab_audio">الصوت</string>
+    <string name="tab_subtitles">الترجمة</string>
+    <string name="tab_chapters">الفصول</string>
+    <string name="nav_transcoder">الاستوديو</string>
+    <string name="nav_presets">الإعدادات المسبقة</string>
+    <string name="nav_queue">طابور المهام</string>
+    <string name="nav_logs">سجل الترميز والعتاد</string>
+    <string name="save_custom_preset">حفظ كإعداد مسبق جديد</string>
+    <string name="share_compressed_video">مشاركة الفيديو المضغوط</string>
+    <string name="export_compressed_video">حفظ نسخة في ملفات الجهاز</string>
+</resources>

@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="320dp"
+    android:height="120dp"
+    android:viewportWidth="320"
+    android:viewportHeight="120">
+    <!-- Studio Dark Gradient Background -->
+    <path android:pathData="M0,0h320v120h-320z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:startX="0"
+                android:startY="0"
+                android:endX="320"
+                android:endY="120"
+                android:type="linear">
+                <item android:offset="0.0" android:color="#FF0B1120" />
+                <item android:offset="0.5" android:color="#FF1E293B" />
+                <item android:offset="1.0" android:color="#FF2E1A0F" />
+            </gradient>
+        </aapt:attr>
+    </path>
+    <!-- Optical Grid & Waveform Lines -->
+    <path
+        android:strokeColor="#2200E5FF"
+        android:strokeWidth="1"
+        android:pathData="M0,30 L320,30 M0,60 L320,60 M0,90 L320,90 M64,0 L64,120 M128,0 L128,120 M192,0 L192,120 M256,0 L256,120" />
+    <!-- Uncompressed Input Wave (Left) -->
+    <path
+        android:strokeColor="#FFFF8C00"
+        android:strokeWidth="3"
+        android:strokeLineCap="round"
+        android:pathData="M16,60 Q32,12 48,60 T80,60 T112,60 T144,60" />
+    <!-- Optical Lens / Compression Funnel (Center) -->
+    <path
+        android:fillColor="#33FF8C00"
+        android:strokeColor="#FFFF8C00"
+        android:strokeWidth="2.5"
+        android:pathData="M142,24 L178,42 L178,78 L142,96 Z" />
+    <!-- High-Density Compressed Output Stream (Right) -->
+    <path
+        android:strokeColor="#FF00E5FF"
+        android:strokeWidth="3"
+        android:strokeLineCap="round"
+        android:pathData="M180,60 L304,60" />
+    <path
+        android:fillColor="#4400E5FF"
+        android:strokeColor="#FF00E5FF"
+        android:strokeWidth="2"
+        android:pathData="M210,38 L250,38 L250,82 L210,82 Z" />
+    <path
+        android:fillColor="#FF00E5FF"
+        android:pathData="M225,52 L225,68 L239,60 Z" />
+</vector>

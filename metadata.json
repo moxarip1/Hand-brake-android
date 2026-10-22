@@ -1,0 +1,6 @@
+{
+  "name": "HandBrake Mobile",
+  "description": "تطبيق احترافي لضغط الفيديوهات وتحويل الصيغ بسرعة فائقة بالاعتماد على تسريع العتاد مع كافة ميزات HandBrake الأصلية.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
