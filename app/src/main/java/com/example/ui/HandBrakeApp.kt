@@ -84,6 +84,8 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.R
 import com.example.data.TranscodeJobEntity
 import com.example.engine.VideoTranscodeEngine
+import com.example.model.AiOptimizationGoal
+import com.example.model.AiVideoAnalysisReport
 import com.example.model.HandBrakeConfig
 import com.example.model.HandBrakePreset
 import com.example.model.HandBrakeTab
@@ -118,7 +120,6 @@ fun HandBrakeApp(
 
     var pendingExportJob by remember { mutableStateOf<TranscodeJobEntity?>(null) }
 
-    // Zero-permission Android Photo Picker for selecting videos
     val videoPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.PickVisualMedia()
     ) { uri ->
@@ -127,7 +128,6 @@ fun HandBrakeApp(
         }
     }
 
-    // SAF CreateDocument launcher for exporting compressed video to user's Downloads/Storage
     val createDocumentLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.CreateDocument("video/*")
     ) { targetUri ->
@@ -138,7 +138,6 @@ fun HandBrakeApp(
         pendingExportJob = null
     }
 
-    // SAF CreateDocument launcher for exporting the latest APK copy as app_name.apk
     val exportApkLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.CreateDocument("application/vnd.android.package-archive")
     ) { targetUri ->
@@ -147,7 +146,6 @@ fun HandBrakeApp(
         }
     }
 
-    // BackHandler for secondary screens
     if (uiState.currentNav != MainNavDestination.STUDIO) {
         BackHandler {
             viewModel.selectNav(MainNavDestination.STUDIO)
@@ -178,7 +176,7 @@ fun HandBrakeApp(
                                 fontWeight = FontWeight.Bold
                             )
                             Text(
-                                text = "ضغط وتحويل الفيديوهات بتسريع العتاد الفائق",
+                                text = "ضغط ذكي بالذكاء الاصطناعي وبنفس القياس الأصلي 1:1",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = HardwareCyan
                             )
@@ -223,7 +221,6 @@ fun HandBrakeApp(
                     .background(MaterialTheme.colorScheme.surface)
                     .navigationBarsPadding()
             ) {
-                // Sticky Quick-Encode & Live Savings Bar when on Studio screen
                 if (uiState.currentNav == MainNavDestination.STUDIO && uiState.sourceVideo != null) {
                     BottomEncodeControlBar(
                         source = uiState.sourceVideo!!,
@@ -290,7 +287,6 @@ fun HandBrakeApp(
                 .fillMaxSize()
                 .padding(innerPadding)
         ) {
-            // Optional status banner
             AnimatedVisibility(visible = uiState.bannerMessageAr != null) {
                 uiState.bannerMessageAr?.let { msg ->
                     Surface(
@@ -331,6 +327,12 @@ fun HandBrakeApp(
                         presets = presets,
                         selectedTab = uiState.selectedTab,
                         selectedThumbIndex = uiState.selectedPreviewThumbIndex,
+                        selectedAiGoal = uiState.selectedAiGoal,
+                        isAnalyzingWithAi = uiState.isAnalyzingWithAi,
+                        aiAnalysisReport = uiState.aiAnalysisReport,
+                        onSelectAiGoal = viewModel::selectAiGoalAndAnalyze,
+                        onRunAiAnalysis = { viewModel.runAiVideoAnalysis(autoApply = true) },
+                        onApplyAiReport = viewModel::applyAiRecommendation,
                         onSelectTab = viewModel::selectTab,
                         onSelectThumb = viewModel::selectPreviewThumb,
                         onPickVideo = {
@@ -395,7 +397,6 @@ fun HandBrakeApp(
         }
     }
 
-    // Video Player & Before/After Comparison Modal
     uiState.inspectingJobForPlayer?.let { job ->
         VideoPlayerComparisonDialog(
             job = job,
@@ -408,7 +409,6 @@ fun HandBrakeApp(
         )
     }
 
-    // Save Custom Preset Modal
     if (uiState.showSavePresetDialog) {
         SaveCustomPresetDialog(
             currentConfig = uiState.config,
@@ -426,6 +426,12 @@ private fun StudioWorkspaceScreen(
     presets: List<HandBrakePreset>,
     selectedTab: HandBrakeTab,
     selectedThumbIndex: Int,
+    selectedAiGoal: AiOptimizationGoal,
+    isAnalyzingWithAi: Boolean,
+    aiAnalysisReport: AiVideoAnalysisReport?,
+    onSelectAiGoal: (AiOptimizationGoal) -> Unit,
+    onRunAiAnalysis: () -> Unit,
+    onApplyAiReport: (AiVideoAnalysisReport) -> Unit,
     onSelectTab: (HandBrakeTab) -> Unit,
     onSelectThumb: (Int) -> Unit,
     onPickVideo: () -> Unit,
@@ -446,17 +452,21 @@ private fun StudioWorkspaceScreen(
         contentPadding = PaddingValues(vertical = 10.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        // 1. Source Video Header Card (matching HandBrake Desktop's Source Inspector)
         item {
             SourceVideoHeaderCard(
                 source = source,
+                config = config,
                 isLoading = isLoadingSource,
+                isAnalyzingWithAi = isAnalyzingWithAi,
                 onPickVideo = onPickVideo,
+                onRunAiOptimize = {
+                    onSelectTab(HandBrakeTab.SUMMARY)
+                    onRunAiAnalysis()
+                },
                 onGenerateSampleVideo = onGenerateSampleVideo
             )
         }
 
-        // 2. Quick Preset Strip + Save Custom Preset Button
         item {
             QuickPresetBar(
                 presets = presets,
@@ -466,7 +476,6 @@ private fun StudioWorkspaceScreen(
             )
         }
 
-        // 3. The 7 Official HandBrake Configuration Tabs
         item {
             ScrollableTabRow(
                 selectedTabIndex = selectedTab.ordinal,
@@ -502,13 +511,18 @@ private fun StudioWorkspaceScreen(
             }
         }
 
-        // 4. Active Tab Content
         item {
             when (selectedTab) {
                 HandBrakeTab.SUMMARY -> SummaryTabContent(
                     source = source,
                     config = config,
                     selectedThumbIndex = selectedThumbIndex,
+                    selectedAiGoal = selectedAiGoal,
+                    isAnalyzingWithAi = isAnalyzingWithAi,
+                    aiAnalysisReport = aiAnalysisReport,
+                    onSelectAiGoal = onSelectAiGoal,
+                    onRunAiAnalysis = onRunAiAnalysis,
+                    onApplyAiReport = onApplyAiReport,
                     onSelectThumb = onSelectThumb,
                     onUpdateConfig = onUpdateConfig
                 )
@@ -552,8 +566,11 @@ private fun StudioWorkspaceScreen(
 @Composable
 private fun SourceVideoHeaderCard(
     source: SourceVideoMetadata?,
+    config: HandBrakeConfig,
     isLoading: Boolean,
+    isAnalyzingWithAi: Boolean,
     onPickVideo: () -> Unit,
+    onRunAiOptimize: () -> Unit,
     onGenerateSampleVideo: () -> Unit
 ) {
     Card(
@@ -601,10 +618,11 @@ private fun SourceVideoHeaderCard(
                     }
 
                     if (source != null) {
+                        val (outW, outH) = VideoTranscodeEngine.computeOutputDimensions(source, config)
                         Text(
-                            text = "${source.width}×${source.height} • ${source.videoCodecName} • ${source.frameRate.roundToInt()} fps",
+                            text = "القياس المثبت: ${outW}×${outH} (${if (source.isPortraitReels) "ريلز 9:16" else "كامل 1:1"}) • ${source.frameRate.roundToInt()} fps سلس",
                             style = MaterialTheme.typography.labelMedium,
-                            color = HardwareCyan
+                            color = SuccessEmerald
                         )
                         Text(
                             text = "الحجم الأصلي: ${VideoTranscodeEngine.formatSize(source.fileSizeBytes)} • المدة: ${
@@ -615,7 +633,7 @@ private fun SourceVideoHeaderCard(
                         )
                     } else if (isLoading) {
                         Text(
-                            text = "جاري فحص المسارات واستخراج الإطارات...",
+                            text = "جاري فحص المسارات وتثبيت الأبعاد الأصلية...",
                             style = MaterialTheme.typography.bodySmall,
                             color = HandBrakeAmber
                         )
@@ -636,16 +654,28 @@ private fun SourceVideoHeaderCard(
                 ) {
                     Icon(Icons.Default.FolderOpen, contentDescription = null)
                     Spacer(Modifier.width(6.dp))
-                    Text("اختيار فيديو من الهاتف", fontWeight = FontWeight.Bold)
+                    Text("اختيار فيديو", fontWeight = FontWeight.Bold)
+                }
+
+                Button(
+                    onClick = onRunAiOptimize,
+                    enabled = !isAnalyzingWithAi && source != null,
+                    modifier = Modifier
+                        .weight(1f)
+                        .testTag("ai_smart_optimize_button"),
+                    colors = ButtonDefaults.buttonColors(containerColor = HardwareCyan)
+                ) {
+                    Icon(Icons.Default.AutoAwesome, contentDescription = null, tint = Color.Black)
+                    Spacer(Modifier.width(4.dp))
+                    Text("تحليل ذكي AI", color = Color.Black, fontWeight = FontWeight.Bold)
                 }
 
                 OutlinedButton(
                     onClick = onGenerateSampleVideo,
-                    modifier = Modifier.testTag("generate_sample_video_button")
+                    modifier = Modifier.testTag("generate_sample_video_button"),
+                    contentPadding = PaddingValues(horizontal = 10.dp)
                 ) {
-                    Icon(Icons.Default.AutoAwesome, contentDescription = null, tint = HardwareCyan)
-                    Spacer(Modifier.width(4.dp))
-                    Text("فيديو تجريبي HD")
+                    Text("تجريبي")
                 }
             }
         }
@@ -666,9 +696,12 @@ private fun QuickPresetBar(
             verticalAlignment = Alignment.CenterVertically
         ) {
             Text(
-                text = "الإعداد المسبق النشط: $activePresetName",
+                text = "الإعداد النشط: $activePresetName",
                 style = MaterialTheme.typography.labelLarge,
-                color = HandBrakeAmber
+                color = HandBrakeAmber,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f)
             )
             Row(
                 modifier = Modifier
@@ -725,6 +758,7 @@ private fun BottomEncodeControlBar(
     onAddToQueue: () -> Unit,
     onStartEncodeNow: () -> Unit
 ) {
+    val (outW, outH) = VideoTranscodeEngine.computeOutputDimensions(source, config)
     val estBytes = VideoTranscodeEngine.estimateOutputSizeBytes(source, config)
     val savingsPct = ((1.0 - (estBytes.toDouble() / source.fileSizeBytes.coerceAtLeast(1L))) * 100).roundToInt()
 
@@ -772,15 +806,15 @@ private fun BottomEncodeControlBar(
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
                         Text(
-                            text = "الحجم المتوقع: ${VideoTranscodeEngine.formatSize(estBytes)} (${config.container.extension.uppercase()} • ${config.videoCodec.shortLabel})",
+                            text = "الناتج: ${VideoTranscodeEngine.formatSize(estBytes)} • القياس: ${outW}×${outH}",
                             style = MaterialTheme.typography.bodySmall,
                             fontWeight = FontWeight.Bold
                         )
                         Text(
                             text = if (savingsPct > 0) {
-                                "يوفر $savingsPct% من الحجم الأصلي (${VideoTranscodeEngine.formatSize(source.fileSizeBytes)})"
+                                "يوفر $savingsPct% من الحجم (${VideoTranscodeEngine.formatSize(source.fileSizeBytes)}) بدون تقطيع"
                             } else {
-                                "تحويل صيغة مباشر فائق السرعة"
+                                "استخراج سلس بنفس قياس المصدر (${outW}×${outH})"
                             },
                             style = MaterialTheme.typography.labelSmall,
                             color = if (savingsPct > 0) SuccessEmerald else HardwareCyan

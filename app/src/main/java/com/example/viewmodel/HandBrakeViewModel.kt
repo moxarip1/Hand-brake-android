@@ -6,16 +6,21 @@ import android.net.Uri
 import androidx.core.content.FileProvider
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.ai.GeminiAiVideoAdvisor
 import com.example.data.HandBrakeDatabase
 import com.example.data.HandBrakeRepository
 import com.example.data.TranscodeJobEntity
 import com.example.engine.VideoTranscodeEngine
+import com.example.model.AiOptimizationGoal
+import com.example.model.AiVideoAnalysisReport
 import com.example.model.ChapterMarker
 import com.example.model.HandBrakeConfig
 import com.example.model.HandBrakePreset
 import com.example.model.HandBrakeTab
 import com.example.model.HardwareCodecInfo
 import com.example.model.OfficialHandBrakePresets
+import com.example.model.QualityMode
+import com.example.model.ResolutionLimit
 import com.example.model.SourceVideoMetadata
 import com.example.model.SubtitleTrackItem
 import kotlinx.coroutines.Job
@@ -46,6 +51,9 @@ data class StudioUiState(
     val isLoadingSource: Boolean = false,
     val config: HandBrakeConfig = HandBrakeConfig(),
     val selectedPreviewThumbIndex: Int = 0,
+    val selectedAiGoal: AiOptimizationGoal = AiOptimizationGoal.BEST_QUALITY_ORIGINAL_SIZE,
+    val isAnalyzingWithAi: Boolean = false,
+    val aiAnalysisReport: AiVideoAnalysisReport? = null,
     val isEncodingNow: Boolean = false,
     val activeJobProgress: Int = 0,
     val activeJobStageAr: String = "",
@@ -58,8 +66,8 @@ data class StudioUiState(
     val showSavePresetDialog: Boolean = false,
     val deviceHardwareCodecs: List<HardwareCodecInfo> = emptyList(),
     val activityLogs: List<String> = listOf(
-        "[HandBrake Mobile 1.8.2-Android] تم تهيئة محرك الترميز المسرّع بالعتاد (MediaCodec HW Engine).",
-        "[System] فحص مسرعات الفيديو والـ GPU المتوفرة على الجهاز..."
+        "[HandBrake Mobile 2.0-AI] تم تهيئة محرك النقل المباشر بالعتاد (Hardware Surface Pipeline) بدون تقطيع.",
+        "[AI Engine] المحلل الذكي للفيديو (Gemini AI Advisor) جاهز لتحليل الأبعاد ومعدل البت."
     )
 )
 
@@ -95,14 +103,12 @@ class HandBrakeViewModel(application: Application) : AndroidViewModel(applicatio
                 initialValue = emptyList()
             )
 
-        // Load real device hardware codecs & auto-generate/load real sample HD video on startup
         viewModelScope.launch {
             val codecs = VideoTranscodeEngine.queryDeviceCodecs()
             val hwEncoders = codecs.count { it.isEncoder && it.isHardwareAccelerated }
             appendLog("تم اكتشاف ${codecs.size} مُرمّز وفك ترميز على الجهاز ($hwEncoders مسرّع بالعتاد الصلب HW).")
             _uiState.update { it.copy(deviceHardwareCodecs = codecs) }
 
-            // Auto-prepare a real sample video so the user can immediately inspect & compress without waiting
             loadOrGenerateSampleVideo(silentBanner = true)
         }
     }
@@ -147,31 +153,48 @@ class HandBrakeViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun loadVideoFromUri(uri: Uri) {
         viewModelScope.launch {
-            _uiState.update { it.copy(isLoadingSource = true, bannerMessageAr = null) }
-            appendLog("جاري فحص مصدر الفيديو المختار: $uri")
+            _uiState.update { it.copy(isLoadingSource = true, bannerMessageAr = null, aiAnalysisReport = null) }
+            appendLog("جاري فحص مصدر الفيديو المختار مع الحفاظ التام على القياس الأصلي 1:1...")
             val metadata = VideoTranscodeEngine.inspectVideo(getApplication(), uri, null)
+            val defaultGoal = if (metadata.isPortraitReels) {
+                AiOptimizationGoal.REELS_TIKTOK_SHORTS
+            } else {
+                AiOptimizationGoal.BEST_QUALITY_ORIGINAL_SIZE
+            }
             _uiState.update { state ->
                 state.copy(
                     sourceVideo = metadata,
                     isLoadingSource = false,
                     selectedPreviewThumbIndex = 0,
+                    selectedAiGoal = defaultGoal,
+                    // Always lock to ORIGINAL 1:1 dimensions and source framerate when loading a video so Reels never shrink!
                     config = state.config.copy(
+                        activePresetName = if (metadata.isPortraitReels) {
+                            "ريلز عمودي 1:1 (${metadata.width}×${metadata.height})"
+                        } else {
+                            "نفس القياس الأصلي 1:1 (${metadata.width}×${metadata.height})"
+                        },
+                        resolutionLimit = ResolutionLimit.ORIGINAL,
                         customWidth = metadata.width,
                         customHeight = metadata.height,
+                        framerateTarget = 0,
+                        rotationDegrees = 0,
                         trimStartFraction = 0f,
                         trimEndFraction = 1f,
                         startChapter = 1,
                         endChapter = metadata.chapters.size.coerceAtLeast(1),
                         customChapters = metadata.chapters
                     ),
-                    bannerMessageAr = "تم فتح الفيديو: ${metadata.fileName} (${metadata.width}×${metadata.height})"
+                    bannerMessageAr = "تم فتح الفيديو بنفس قياسه الأصلي تماماً: ${metadata.width}×${metadata.height} (${if (metadata.isPortraitReels) "قياس ريلز 9:16" else "قياس كامل"})"
                 )
             }
             appendLog(
-                "تم تحميل المصدر: ${metadata.fileName} | الدقة: ${metadata.width}x${metadata.height} | المدة: ${
+                "تم تحميل المصدر: ${metadata.fileName} | القياس الأصلي المثبت: ${metadata.width}x${metadata.height} | المدة: ${
                     VideoTranscodeEngine.formatDuration(metadata.durationMs)
                 } | الحجم: ${VideoTranscodeEngine.formatSize(metadata.fileSizeBytes)}"
             )
+            // Automatically run AI Video Analysis on the newly selected video
+            runAiVideoAnalysis(defaultGoal, autoApply = true)
         }
     }
 
@@ -190,21 +213,73 @@ class HandBrakeViewModel(application: Application) : AndroidViewModel(applicatio
                         isLoadingSource = false,
                         selectedPreviewThumbIndex = 0,
                         config = state.config.copy(
+                            resolutionLimit = ResolutionLimit.ORIGINAL,
                             customWidth = metadata.width,
                             customHeight = metadata.height,
+                            framerateTarget = 0,
                             trimStartFraction = 0f,
                             trimEndFraction = 1f,
                             startChapter = 1,
                             endChapter = metadata.chapters.size.coerceAtLeast(1),
                             customChapters = metadata.chapters
                         ),
-                        bannerMessageAr = if (silentBanner) null else "تم توليد وتحميل الفيديو التجريبي الحقيقي (HD 720p MP4) بنجاح!"
+                        bannerMessageAr = if (silentBanner) null else "تم توليد وتحميل الفيديو التجريبي السلس (HD 30fps) بنجاح!"
                     )
                 }
+                runAiVideoAnalysis(AiOptimizationGoal.BEST_QUALITY_ORIGINAL_SIZE, autoApply = false)
             } catch (e: Exception) {
                 appendLog("خطأ أثناء توليد الفيديو التجريبي: ${e.localizedMessage}")
                 _uiState.update { it.copy(isLoadingSource = false) }
             }
+        }
+    }
+
+    fun selectAiGoalAndAnalyze(goal: AiOptimizationGoal) {
+        _uiState.update { it.copy(selectedAiGoal = goal) }
+        runAiVideoAnalysis(goal, autoApply = true)
+    }
+
+    fun runAiVideoAnalysis(goal: AiOptimizationGoal = _uiState.value.selectedAiGoal, autoApply: Boolean = true) {
+        val source = _uiState.value.sourceVideo ?: return
+        viewModelScope.launch {
+            _uiState.update { it.copy(isAnalyzingWithAi = true, selectedAiGoal = goal) }
+            appendLog("بدء تحليل الفيديو بالذكاء الاصطناعي لهدف: ${goal.titleAr}...")
+            val report = GeminiAiVideoAdvisor.analyzeVideo(source, goal)
+            _uiState.update { state ->
+                state.copy(
+                    isAnalyzingWithAi = false,
+                    aiAnalysisReport = report
+                )
+            }
+            appendLog("اكتمل تحليل الذكاء الاصطناعي: ${report.contentTypeAr} | موصى بـ ${report.recommendedCodec.shortLabel} RF ${report.recommendedRf.toInt()} مع حفظ الأبعاد ${source.width}×${source.height}.")
+            if (autoApply) {
+                applyAiRecommendation(report)
+            }
+        }
+    }
+
+    fun applyAiRecommendation(report: AiVideoAnalysisReport) {
+        val source = _uiState.value.sourceVideo
+        _uiState.update { state ->
+            state.copy(
+                config = state.config.copy(
+                    activePresetName = "ضبط الذكاء الاصطناعي (${report.goal.titleAr})",
+                    container = report.recommendedContainer,
+                    resolutionLimit = ResolutionLimit.ORIGINAL, // Always preserve exact original video/Reels size
+                    customWidth = source?.width ?: state.config.customWidth,
+                    customHeight = source?.height ?: state.config.customHeight,
+                    videoCodec = report.recommendedCodec,
+                    qualityMode = QualityMode.CONSTANT_QUALITY_RF,
+                    constantQualityRf = report.recommendedRf,
+                    framerateTarget = report.recommendedFps,
+                    framerateMode = report.recommendedFramerateMode,
+                    encoderPresetSpeed = report.recommendedSpeed,
+                    audioCodec = report.recommendedAudioCodec,
+                    audioBitrateKbps = report.recommendedAudioBitrateKbps,
+                    webOptimized = true
+                ),
+                bannerMessageAr = "تم تطبيق إعدادات الذكاء الاصطناعي المثالية مع الحفاظ على القياس الأصلي (${source?.width ?: 1080}×${source?.height ?: 1920}) وتوفير ~${report.estimatedSavingsPercent}%!"
+            )
         }
     }
 
@@ -218,6 +293,8 @@ class HandBrakeViewModel(application: Application) : AndroidViewModel(applicatio
         _uiState.update { state ->
             val currentSource = state.sourceVideo
             val updatedConfig = preset.config.copy(
+                customWidth = currentSource?.width ?: preset.config.customWidth,
+                customHeight = currentSource?.height ?: preset.config.customHeight,
                 customChapters = currentSource?.chapters ?: emptyList(),
                 endChapter = currentSource?.chapters?.size ?: 1
             )
@@ -352,7 +429,7 @@ class HandBrakeViewModel(application: Application) : AndroidViewModel(applicatio
                 cliCommand = hbCli
             )
             val id = repository.addJob(jobEntity).toInt()
-            appendLog("تمت إضافة المهمة #$id إلى الطابور: $outFileName")
+            appendLog("تمت إضافة المهمة #$id إلى الطابور: $outFileName (${outW}×${outH})")
 
             if (startImmediately) {
                 startEncodingJob(jobEntity.copy(id = id), source, cfg)
@@ -402,7 +479,7 @@ class HandBrakeViewModel(application: Application) : AndroidViewModel(applicatio
             it.copy(
                 isEncodingNow = true,
                 activeJobProgress = 1,
-                activeJobStageAr = "بدء محرك الضغط والتحويل...",
+                activeJobStageAr = "بدء النقل المباشر للإطارات عبر العتاد...",
                 activeJobFps = 0f,
                 activeJobSpeed = 1f,
                 activeJobLiveBytes = 0L,
@@ -410,7 +487,7 @@ class HandBrakeViewModel(application: Application) : AndroidViewModel(applicatio
             )
         }
 
-        val runningJob = job.copy(status = "RUNNING", progressPercent = 2, currentStageAr = "جاري التحويل...")
+        val runningJob = job.copy(status = "RUNNING", progressPercent = 2, currentStageAr = "جاري التحويل السلس...")
         repository.updateJob(runningJob)
         appendLog("بدء تنفيذ المهمة #${job.id}: ${job.cliCommand}")
 
@@ -437,7 +514,7 @@ class HandBrakeViewModel(application: Application) : AndroidViewModel(applicatio
             val completedJob = runningJob.copy(
                 status = "COMPLETED",
                 progressPercent = 100,
-                currentStageAr = "مكتمل بنجاح",
+                currentStageAr = "مكتمل بنجاح (فيديو سلس ${job.targetResolution})",
                 outputFilePath = result.outputFile.absolutePath,
                 outputFileName = result.outputFile.name,
                 outputSizeBytes = result.outputSizeBytes,
@@ -458,7 +535,7 @@ class HandBrakeViewModel(application: Application) : AndroidViewModel(applicatio
                     activeJobProgress = 100,
                     latestCompletedJob = completedJob,
                     inspectingJobForPlayer = completedJob,
-                    bannerMessageAr = "تم ضغط الفيديو بنجاح! ($savedRatio)"
+                    bannerMessageAr = "تم ضغط الفيديو بسلاسة كاملة وبنفس القياس (${job.targetResolution})! ($savedRatio)"
                 )
             }
             appendLog("اكتملت المهمة #${job.id} بنجاح! الملف الناتج: ${result.outputFile.absolutePath}")

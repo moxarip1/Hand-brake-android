@@ -23,23 +23,22 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AspectRatio
+import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Compress
 import androidx.compose.material.icons.filled.Crop
-import androidx.compose.material.icons.filled.Flip
-import androidx.compose.material.icons.filled.HighQuality
-import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.Rotate90DegreesCcw
-import androidx.compose.material.icons.filled.Speed
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.RangeSlider
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Switch
@@ -56,15 +55,17 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.example.engine.VideoTranscodeEngine
+import com.example.model.AiOptimizationGoal
+import com.example.model.AiVideoAnalysisReport
 import com.example.model.AnamorphicMode
 import com.example.model.ContainerFormat
 import com.example.model.HandBrakeConfig
-import com.example.model.RangeSelectionMode
 import com.example.model.ResolutionLimit
 import com.example.model.SourceVideoMetadata
 import com.example.ui.theme.HandBrakeAmber
 import com.example.ui.theme.HardwareCyan
 import com.example.ui.theme.SuccessEmerald
+import kotlin.math.max
 import kotlin.math.roundToInt
 
 @OptIn(ExperimentalLayoutApi::class)
@@ -73,6 +74,12 @@ fun SummaryTabContent(
     source: SourceVideoMetadata?,
     config: HandBrakeConfig,
     selectedThumbIndex: Int,
+    selectedAiGoal: AiOptimizationGoal,
+    isAnalyzingWithAi: Boolean,
+    aiAnalysisReport: AiVideoAnalysisReport?,
+    onSelectAiGoal: (AiOptimizationGoal) -> Unit,
+    onRunAiAnalysis: () -> Unit,
+    onApplyAiReport: (AiVideoAnalysisReport) -> Unit,
     onSelectThumb: (Int) -> Unit,
     onUpdateConfig: ((HandBrakeConfig) -> HandBrakeConfig) -> Unit
 ) {
@@ -82,7 +89,20 @@ fun SummaryTabContent(
             .padding(vertical = 8.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
-        // 1. Live Interactive Frame Preview + Filter/Crop Simulation
+        // 1. AI Smart Video Analyzer & Optimal Settings Advisor Card
+        if (source != null) {
+            AiVideoAdvisorCard(
+                source = source,
+                selectedGoal = selectedAiGoal,
+                isAnalyzing = isAnalyzingWithAi,
+                report = aiAnalysisReport,
+                onSelectGoal = onSelectAiGoal,
+                onRunAnalysis = onRunAiAnalysis,
+                onApplyReport = onApplyAiReport
+            )
+        }
+
+        // 2. Live Interactive Frame Preview + Exact Aspect Ratio (Reels 9:16 & Landscape 16:9)
         if (source != null) {
             LivePreviewCard(
                 source = source,
@@ -93,7 +113,7 @@ fun SummaryTabContent(
             )
         }
 
-        // 2. Container Format Selection (Format: MP4, MKV, WebM)
+        // 3. Container Format Selection (Format: MP4, MKV, WebM)
         Card(
             colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
             shape = RoundedCornerShape(16.dp),
@@ -167,7 +187,6 @@ fun SummaryTabContent(
 
                 HorizontalDivider(color = MaterialTheme.colorScheme.surfaceVariant)
 
-                // Container Options (Web Optimized, Align A/V Start, Passthru Common Metadata)
                 HandBrakeSwitchRow(
                     title = "تحسين للبث السريع عبر الويب (Web Optimized / FastStart)",
                     subtitle = "ينقل ذرة moov إلى بداية ملف MP4 ليعمل فوراً أثناء التحميل",
@@ -178,7 +197,7 @@ fun SummaryTabContent(
 
                 HandBrakeSwitchRow(
                     title = "مزامنة بداية الصوت والفيديو (Align A/V Start)",
-                    subtitle = "يمنع تأخر الصوت عن الصورة عند قص بداية الفيديو",
+                    subtitle = "يمنع تأخر الصوت عن الصورة ويحافظ على تزامن الإطارات",
                     checked = config.alignAvStart,
                     tag = "switch_align_av",
                     onCheckedChange = { checked -> onUpdateConfig { it.copy(alignAvStart = checked) } }
@@ -186,7 +205,7 @@ fun SummaryTabContent(
 
                 HandBrakeSwitchRow(
                     title = "الاحتفاظ بالبيانات الوصفية (Passthru Common Metadata)",
-                    subtitle = "ينسخ تاريخ التصوير وبيانات الكاميرا إلى الملف المضغوط",
+                    subtitle = "ينسخ تاريخ التصوير واتجاه الفيديو الأصلي إلى الملف المضغوط",
                     checked = config.passthruMetadata,
                     tag = "switch_metadata_passthru",
                     onCheckedChange = { checked -> onUpdateConfig { it.copy(passthruMetadata = checked) } }
@@ -194,7 +213,7 @@ fun SummaryTabContent(
             }
         }
 
-        // 3. Summary Technical Track Inspector (like Desktop HandBrake's bottom summary table)
+        // 4. Summary Technical Track Inspector
         if (source != null) {
             val (outW, outH) = VideoTranscodeEngine.computeOutputDimensions(source, config)
             val targetBitrateKbps = VideoTranscodeEngine.computeTargetVideoBitrateBps(source, config) / 1000
@@ -248,29 +267,209 @@ fun SummaryTabContent(
                         highlightColor = SuccessEmerald
                     )
                     SummaryDetailRow(
-                        label = "الأبعاد (Dimensions)",
-                        value = "${source.width}×${source.height}  ←  ${outW}×${outH} (${config.anamorphicMode.name})"
+                        label = "الأبعاد والقياس (Dimensions)",
+                        value = "${source.width}×${source.height}  ←  ${outW}×${outH} (${if (outW == source.width && outH == source.height) "نفس القياس الأصلي 1:1" else config.resolutionLimit.name})",
+                        highlightColor = HardwareCyan
                     )
                     SummaryDetailRow(
                         label = "مُرمّز الفيديو (Video Encoder)",
                         value = "${config.videoCodec.displayName} • ~$targetBitrateKbps kbps"
                     )
                     SummaryDetailRow(
-                        label = "معدل الإطارات والسرعة",
-                        value = "${if (config.framerateTarget == 0) "${source.frameRate.roundToInt()} fps" else "${config.framerateTarget} fps"} (${config.framerateMode.code.uppercase()}) • Preset: ${config.encoderPresetSpeed.label}"
+                        label = "سلاسة الإطارات والسرعة",
+                        value = "${if (config.framerateTarget == 0) "${source.frameRate.roundToInt()} fps (نفس المصدر)" else "${config.framerateTarget} fps"} • Hardware Surface"
                     )
                     SummaryDetailRow(
                         label = "مسار الصوت (Audio Track)",
                         value = if (config.audioCodec.isMuted) {
                             "بدون صوت (Muted - صامت)"
                         } else if (config.audioCodec.isPassthru) {
-                            "نسخ مباشر (Auto Passthru ${source.audioCodecName})"
+                            "نسخ مباشر نقي (Auto Passthru ${source.audioCodecName})"
                         } else {
                             "${config.audioCodec.name} • ${config.audioBitrateKbps} kbps • ${config.audioMixdown.labelAr}"
                         }
                     )
                 }
             }
+        }
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun AiVideoAdvisorCard(
+    source: SourceVideoMetadata,
+    selectedGoal: AiOptimizationGoal,
+    isAnalyzing: Boolean,
+    report: AiVideoAnalysisReport?,
+    onSelectGoal: (AiOptimizationGoal) -> Unit,
+    onRunAnalysis: () -> Unit,
+    onApplyReport: (AiVideoAnalysisReport) -> Unit
+) {
+    Card(
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        shape = RoundedCornerShape(16.dp),
+        border = BorderStroke(1.5.dp, HardwareCyan.copy(alpha = 0.65f))
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Icon(
+                        Icons.Default.AutoAwesome,
+                        contentDescription = null,
+                        tint = HardwareCyan,
+                        modifier = Modifier.size(22.dp)
+                    )
+                    Column {
+                        Text(
+                            text = "محلل الفيديو الذكي بالذكاء الاصطناعي (AI Optimizer)",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = HardwareCyan
+                        )
+                        Text(
+                            text = "يحلل أبعاد الفيديو ومحتوى الإطارات لاختيار أفضل إعدادات ضغط بدون تقليص أو تقطيع",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+
+                if (isAnalyzing) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(24.dp),
+                        color = HardwareCyan,
+                        strokeWidth = 2.5.dp
+                    )
+                }
+            }
+
+            Text(
+                text = "اختر هدف التحليل والضبط الذكي:",
+                style = MaterialTheme.typography.labelLarge,
+                color = HandBrakeAmber
+            )
+
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                AiOptimizationGoal.entries.forEach { goal ->
+                    val selected = selectedGoal == goal
+                    FilterChip(
+                        selected = selected,
+                        onClick = { onSelectGoal(goal) },
+                        label = { Text(goal.titleAr) },
+                        colors = FilterChipDefaults.filterChipColors(
+                            selectedContainerColor = HardwareCyan.copy(alpha = 0.22f),
+                            selectedLabelColor = HardwareCyan
+                        ),
+                        modifier = Modifier.testTag("ai_goal_${goal.name}")
+                    )
+                }
+            }
+
+            if (report != null) {
+                Card(
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f)
+                    ),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Column(
+                        modifier = Modifier.padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "نتيجة فحص الذكاء الاصطناعي (${if (report.poweredByGeminiCloud) "Gemini 3.5 Flash" else "Smart AI Analyzer"}):",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = HandBrakeAmber
+                            )
+                            Box(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(6.dp))
+                                    .background(SuccessEmerald.copy(alpha = 0.2f))
+                                    .padding(horizontal = 8.dp, vertical = 2.dp)
+                            ) {
+                                Text(
+                                    text = "توفير ~${report.estimatedSavingsPercent}%",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = SuccessEmerald
+                                )
+                            }
+                        }
+
+                        Text(
+                            text = "• نوع الفيديو المكتشف: ${report.contentTypeAr}",
+                            style = MaterialTheme.typography.bodySmall,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            text = "• التشخيص التقني: ${report.technicalDiagnosisAr}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Text(
+                            text = "• الإعدادات المثالية المطبقة: ${report.recommendedCodec.shortLabel} • RF ${report.recommendedRf.toInt()} • أبعاد 1:1 (${source.width}×${source.height}) • ${report.recommendedSpeed.labelAr}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = HardwareCyan,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            text = report.whyTheseSettingsAr,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Button(
+                    onClick = {
+                        if (report != null) onApplyReport(report) else onRunAnalysis()
+                    },
+                    enabled = !isAnalyzing,
+                    modifier = Modifier
+                        .weight(1f)
+                        .testTag("apply_ai_settings_button"),
+                    colors = ButtonDefaults.buttonColors(containerColor = HardwareCyan)
+                ) {
+                    Icon(Icons.Default.AutoAwesome, contentDescription = null, tint = Color.Black)
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        text = if (report != null) "تطبيق الإعدادات المثالية تلقائياً" else "تحليل الفيديو بالذكاء الاصطناعي",
+                        color = Color.Black,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
+
+            // Prototype API Key Security Caution Notice per gemini-api skill
+            Text(
+                text = "ملاحظة أمان (Prototype): يتم استدعاء Gemini API عبر مفتاح BuildConfig.GEMINI_API_KEY المضاف في لوحة Secrets. لا تشارك ملف الـ APK علناً إذا كان يتضمن مفتاحاً خاصاً.",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.75f)
+            )
         }
     }
 }
@@ -284,6 +483,7 @@ private fun LivePreviewCard(
     onUpdateConfig: ((HandBrakeConfig) -> HandBrakeConfig) -> Unit
 ) {
     val (outW, outH) = VideoTranscodeEngine.computeOutputDimensions(source, config)
+    val isPortrait = outH > outW
     val rawBitmap = source.thumbnails.getOrNull(selectedThumbIndex) ?: source.thumbnails.firstOrNull()
     val processedPreview = remember(
         rawBitmap,
@@ -303,10 +503,14 @@ private fun LivePreviewCard(
         config.padBottom
     ) {
         rawBitmap?.let {
+            val maxDim = 340
+            val scale = maxDim.toFloat() / max(outW, outH).coerceAtLeast(1)
+            val prevW = (outW * scale).roundToInt().coerceAtLeast(120)
+            val prevH = (outH * scale).roundToInt().coerceAtLeast(120)
             VideoTranscodeEngine.applyHandBrakeFiltersAndCrop(
                 it,
-                320,
-                (320f * outH / outW.coerceAtLeast(1)).roundToInt().coerceIn(140, 260),
+                prevW,
+                prevH,
                 config
             )
         }
@@ -327,33 +531,39 @@ private fun LivePreviewCard(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = "المعاينة الحية وتحديد النطاق (Live Preview & Trim)",
+                    text = "المعاينة الحية وتحديد النطاق (${if (isPortrait) "قياس ريلز عمودي 9:16" else "قياس كامل"})",
                     style = MaterialTheme.typography.titleSmall,
                     fontWeight = FontWeight.Bold
                 )
-                Text(
-                    text = "${outW}×${outH}",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = HardwareCyan
-                )
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(HardwareCyan.copy(alpha = 0.16f))
+                        .padding(horizontal = 8.dp, vertical = 3.dp)
+                ) {
+                    Text(
+                        text = "${outW}×${outH} (1:1)",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = HardwareCyan
+                    )
+                }
             }
 
             if (processedPreview != null) {
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(175.dp)
+                        .height(if (isPortrait) 250.dp else 185.dp)
                         .clip(RoundedCornerShape(12.dp))
                         .background(Color.Black),
                     contentAlignment = Alignment.Center
                 ) {
                     Image(
                         bitmap = processedPreview.asImageBitmap(),
-                        contentDescription = "معاينة الإطار بعد الفلاتر والقص",
+                        contentDescription = "معاينة الإطار بالقياس الفعلي",
                         modifier = Modifier.fillMaxSize(),
                         contentScale = ContentScale.Fit
                     )
-                    // Subtitle Burn-in Live Overlay Preview
                     val burnInSub = config.subtitles.firstOrNull { it.burnIn }
                     if (burnInSub != null) {
                         Box(
@@ -374,7 +584,6 @@ private fun LivePreviewCard(
                 }
             }
 
-            // Timeline Thumbnail Filmstrip
             if (source.thumbnails.size > 1) {
                 Row(
                     modifier = Modifier
@@ -386,8 +595,8 @@ private fun LivePreviewCard(
                         val isSelected = idx == selectedThumbIndex
                         Box(
                             modifier = Modifier
-                                .width(76.dp)
-                                .height(46.dp)
+                                .width(if (isPortrait) 52.dp else 76.dp)
+                                .height(if (isPortrait) 76.dp else 46.dp)
                                 .clip(RoundedCornerShape(8.dp))
                                 .border(
                                     width = if (isSelected) 2.dp else 1.dp,
@@ -407,7 +616,6 @@ private fun LivePreviewCard(
                 }
             }
 
-            // Range Selection (Seconds / Chapters / Frames)
             val startMs = (source.durationMs * config.trimStartFraction).toLong()
             val endMs = (source.durationMs * config.trimEndFraction).toLong()
             Row(
@@ -476,6 +684,16 @@ fun DimensionsTabContent(
                     )
                 }
 
+                if (source != null) {
+                    val (outW, outH) = VideoTranscodeEngine.computeOutputDimensions(source, config)
+                    Text(
+                        text = "القياس الأصلي: ${source.width}×${source.height}  ←  قياس الاستخراج الفعلي: ${outW}×${outH}",
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = SuccessEmerald
+                    )
+                }
+
                 FlowRow(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp)
@@ -495,6 +713,7 @@ fun DimensionsTabContent(
                 }
 
                 if (config.resolutionLimit == ResolutionLimit.CUSTOM) {
+                    val isPortrait = (source?.height ?: 1920) > (source?.width ?: 1080)
                     Text(
                         text = "العرض المخصص: ${config.customWidth}px × الارتفاع: ${config.customHeight}px",
                         style = MaterialTheme.typography.bodyMedium,
@@ -503,8 +722,12 @@ fun DimensionsTabContent(
                     Slider(
                         value = config.customWidth.toFloat(),
                         onValueChange = { w ->
-                            val alignedW = ((w.roundToInt() / 16) * 16).coerceIn(320, 3840)
-                            val alignedH = (((alignedW * 9) / 16) / 16) * 16
+                            val alignedW = ((w.roundToInt() / 2) * 2).coerceIn(320, 3840)
+                            val alignedH = if (isPortrait) {
+                                (((alignedW * 16) / 9) / 2) * 2
+                            } else {
+                                (((alignedW * 9) / 16) / 2) * 2
+                            }
                             onUpdateConfig { it.copy(customWidth = alignedW, customHeight = alignedH) }
                         },
                         valueRange = 320f..3840f
@@ -602,8 +825,8 @@ fun DimensionsTabContent(
                 }
 
                 HandBrakeSwitchRow(
-                    title = "قص الحواف السوداء تلقائياً (Automatic Cropping)",
-                    subtitle = "يزيل الأشرطة السوداء العلوية والسفلية تلقائياً",
+                    title = "بدون قص / الحفاظ على الإطار الكامل (Full Frame 0px Crop)",
+                    subtitle = "يحافظ على كامل إطار الفيديو الأصلي بدون اقتطاع أي بكسل",
                     checked = config.autoCrop,
                     tag = "switch_auto_crop",
                     onCheckedChange = { auto ->
