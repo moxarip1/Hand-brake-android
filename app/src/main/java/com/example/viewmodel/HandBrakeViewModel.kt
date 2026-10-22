@@ -511,10 +511,12 @@ class HandBrakeViewModel(application: Application) : AndroidViewModel(applicatio
         }
 
         if (result.success && result.outputFile != null) {
+            val finalRes = result.actualResolution.ifBlank { job.targetResolution }
             val completedJob = runningJob.copy(
                 status = "COMPLETED",
                 progressPercent = 100,
-                currentStageAr = "مكتمل بنجاح (فيديو سلس ${job.targetResolution})",
+                targetResolution = finalRes,
+                currentStageAr = "مكتمل بنجاح (فيديو سلس $finalRes)",
                 outputFilePath = result.outputFile.absolutePath,
                 outputFileName = result.outputFile.name,
                 outputSizeBytes = result.outputSizeBytes,
@@ -535,23 +537,24 @@ class HandBrakeViewModel(application: Application) : AndroidViewModel(applicatio
                     activeJobProgress = 100,
                     latestCompletedJob = completedJob,
                     inspectingJobForPlayer = completedJob,
-                    bannerMessageAr = "تم ضغط الفيديو بسلاسة كاملة وبنفس القياس (${job.targetResolution})! ($savedRatio)"
+                    bannerMessageAr = "تم ضغط الفيديو بسلاسة كاملة وبنفس نسبة القياس ($finalRes)! ($savedRatio)"
                 )
             }
-            appendLog("اكتملت المهمة #${job.id} بنجاح! الملف الناتج: ${result.outputFile.absolutePath}")
+            appendLog("اكتملت المهمة #${job.id} بنجاح ($finalRes)! الملف الناتج: ${result.outputFile.absolutePath}")
         } else {
+            val detailedErr = result.errorMessage?.takeIf { it.isNotBlank() } ?: "فشل التحويل بواسطة مشفر العتاد"
             val failedJob = runningJob.copy(
                 status = "FAILED",
-                currentStageAr = result.errorMessage ?: "فشل التحويل"
+                currentStageAr = detailedErr
             )
             repository.updateJob(failedJob)
             _uiState.update {
                 it.copy(
                     isEncodingNow = false,
-                    bannerMessageAr = "تعذر إكمال المهمة: ${result.errorMessage}"
+                    bannerMessageAr = "تعذر إكمال المهمة: $detailedErr"
                 )
             }
-            appendLog("فشلت المهمة #${job.id}: ${result.errorMessage}")
+            appendLog("فشلت المهمة #${job.id}: $detailedErr")
         }
     }
 

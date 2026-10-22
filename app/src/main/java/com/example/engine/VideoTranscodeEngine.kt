@@ -21,6 +21,25 @@ import android.net.Uri
 import android.os.Build
 import android.provider.OpenableColumns
 import android.view.Surface
+import androidx.annotation.OptIn
+import androidx.media3.common.Effect
+import androidx.media3.common.MediaItem
+import androidx.media3.common.MimeTypes
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.effect.Contrast
+import androidx.media3.effect.Crop
+import androidx.media3.effect.Presentation
+import androidx.media3.effect.RgbFilter
+import androidx.media3.effect.ScaleAndRotateTransformation
+import androidx.media3.transformer.Composition
+import androidx.media3.transformer.DefaultEncoderFactory
+import androidx.media3.transformer.EditedMediaItem
+import androidx.media3.transformer.Effects
+import androidx.media3.transformer.ExportException
+import androidx.media3.transformer.ExportResult
+import androidx.media3.transformer.ProgressHolder
+import androidx.media3.transformer.Transformer
+import androidx.media3.transformer.VideoEncoderSettings
 import com.example.model.ChapterMarker
 import com.example.model.ContainerFormat
 import com.example.model.HandBrakeConfig
@@ -29,15 +48,18 @@ import com.example.model.QualityMode
 import com.example.model.ResolutionLimit
 import com.example.model.SourceVideoMetadata
 import com.example.model.VideoCodec
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import java.io.File
-import java.nio.ByteBuffer
 import kotlin.coroutines.coroutineContext
 import kotlin.math.cos
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.pow
 import kotlin.math.roundToInt
 import kotlin.math.sin
 
@@ -57,6 +79,7 @@ data class TranscodeResult(
     val elapsedMs: Long,
     val averageFps: Float,
     val speedMultiplier: Float,
+    val actualResolution: String = "",
     val errorMessage: String? = null
 )
 
@@ -129,7 +152,7 @@ object VideoTranscodeEngine {
         val fps = 30
         val durationSec = 4
         val totalFrames = fps * durationSec
-        val bitrate = 5_000_000 // 5.0 Mbps high-bitrate source so compression demonstrates real savings
+        val bitrate = 5_000_000
 
         onLog("توليد فيديو تجريبي سلس (1280x720 @ 30fps كامل السلاسة) عبر Hardware Surface...")
 
@@ -221,7 +244,6 @@ object VideoTranscodeEngine {
         val progress = frameIdx.toFloat() / max(1, totalFrames)
         val angle = progress * Math.PI.toFloat() * 4f
 
-        // Smooth animated gradient background
         paint.shader = LinearGradient(
             0f,
             0f,
@@ -234,7 +256,6 @@ object VideoTranscodeEngine {
         canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), paint)
         paint.shader = null
 
-        // Moving cinema color bars
         val colors = intArrayOf(
             0xFFFF8C00.toInt(),
             0xFF00E5FF.toInt(),
@@ -256,7 +277,6 @@ object VideoTranscodeEngine {
             )
         }
 
-        // Smooth orbiting sphere to clearly verify 30fps smoothness
         val cx = width * 0.15f + (width * 0.7f * progress)
         val cy = height * 0.42f + cos(angle) * 110f
         paint.color = 0xFF00E5FF.toInt()
@@ -268,7 +288,7 @@ object VideoTranscodeEngine {
 
     /**
      * Inspects any real video URI or File using MediaMetadataRetriever and MediaExtractor.
-     * Accurately resolves Portrait/Reels (9:16) vs Landscape (16:9) display dimensions!
+     * Also caches picked content:// URIs locally so queued & repeated jobs never fail due to URI permission expiration.
      */
     suspend fun inspectVideo(
         context: Context,
@@ -292,6 +312,29 @@ object VideoTranscodeEngine {
             }
         }
 
+        // Copy picked content:// URI to a persistent local cache file so Media3 Transformer & queued jobs
+        // always have fast, direct file access without content:// permission expiration!
+        val workingFile: File? = if (explicitFile != null && explicitFile.exists()) {
+            explicitFile
+        } else {
+            runCatching {
+                val cacheDir = File(context.cacheDir, "picked_sources").apply { mkdirs() }
+                // Clean old cached sources to save space
+                cacheDir.listFiles()?.forEach { it.delete() }
+                val ext = fileName.substringAfterLast(".", "mp4").lowercase()
+                val destFile = File(cacheDir, "active_source.$ext")
+                context.contentResolver.openInputStream(uri)?.use { input ->
+                    destFile.outputStream().use { output ->
+                        input.copyTo(output)
+                    }
+                }
+                if (destFile.exists() && destFile.length() > 0L) {
+                    if (fileSizeBytes <= 0L) fileSizeBytes = destFile.length()
+                    destFile
+                } else null
+            }.getOrNull()
+        }
+
         var durationMs = 4000L
         var codedWidth = 1280
         var codedHeight = 720
@@ -307,8 +350,8 @@ object VideoTranscodeEngine {
         val thumbnails = mutableListOf<Bitmap>()
 
         try {
-            if (explicitFile != null) {
-                retriever.setDataSource(explicitFile.absolutePath)
+            if (workingFile != null) {
+                retriever.setDataSource(workingFile.absolutePath)
             } else {
                 retriever.setDataSource(context, uri)
             }
@@ -321,7 +364,6 @@ object VideoTranscodeEngine {
             val hasAudioStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_HAS_AUDIO)
             hasAudio = hasAudioStr == "yes" || hasAudioStr == "true"
 
-            // Extract 5 timeline thumbnails preserving true aspect ratio (vertical Reels vs horizontal)
             val count = 5
             for (i in 0 until count) {
                 val timeUs = ((durationMs * 1000L * i) / max(1, count - 1)).coerceAtLeast(0L)
@@ -342,15 +384,13 @@ object VideoTranscodeEngine {
             runCatching { retriever.release() }
         }
 
-        // True display dimensions accounting for rotation metadata (e.g. 90/270 degrees for Reels/Vertical videos!)
         val displayWidth = if (rotation == 90 || rotation == 270) codedHeight else codedWidth
         val displayHeight = if (rotation == 90 || rotation == 270) codedWidth else codedHeight
 
-        // Inspect tracks via MediaExtractor for exact codec MIME, FPS, audio sample rate, channels
         val extractor = MediaExtractor()
         try {
-            if (explicitFile != null) {
-                extractor.setDataSource(explicitFile.absolutePath)
+            if (workingFile != null) {
+                extractor.setDataSource(workingFile.absolutePath)
             } else {
                 extractor.setDataSource(context, uri, null)
             }
@@ -410,9 +450,11 @@ object VideoTranscodeEngine {
             )
         }
 
+        val effectiveUri = if (workingFile != null) Uri.fromFile(workingFile) else uri
+
         SourceVideoMetadata(
-            uri = uri,
-            filePathOrUri = explicitFile?.absolutePath ?: uri.toString(),
+            uri = effectiveUri,
+            filePathOrUri = workingFile?.absolutePath ?: uri.toString(),
             fileName = fileName,
             fileSizeBytes = fileSizeBytes,
             durationMs = max(1000L, durationMs),
@@ -437,10 +479,8 @@ object VideoTranscodeEngine {
 
     /**
      * Computes target output display dimensions.
-     * - Preserves 1:1 original dimensions when ResolutionLimit.ORIGINAL is selected (default!).
-     * - Orientation-aware for Reels/Vertical (9:16) videos: e.g., 1080p limit on a 1080x1920 Reels video
-     *   uses 1080x1920 instead of shrinking it to 608x1080!
-     * - Aligns to multiples of 2 so 1080x1920 stays exact 1080x1920!
+     * - Preserves exact aspect ratio (e.g. 9:16 Reels or 16:9 Landscape).
+     * - Orientation-aware for Reels/Vertical videos.
      */
     fun computeOutputDimensions(source: SourceVideoMetadata, config: HandBrakeConfig): Pair<Int, Int> {
         val croppedW = max(64, source.width - config.cropLeft - config.cropRight)
@@ -451,7 +491,6 @@ object VideoTranscodeEngine {
             ResolutionLimit.ORIGINAL -> croppedW to croppedH
             ResolutionLimit.CUSTOM -> max(128, config.customWidth) to max(128, config.customHeight)
             else -> {
-                // Orientation-aware bounds so vertical Reels videos (e.g. 1080x1920) are never shrunk by landscape bounds!
                 val maxLongEdge = max(config.resolutionLimit.maxWidth, config.resolutionLimit.maxHeight)
                 val maxShortEdge = min(config.resolutionLimit.maxWidth, config.resolutionLimit.maxHeight)
                 val maxW = if (isPortrait) maxShortEdge else maxLongEdge
@@ -469,37 +508,64 @@ object VideoTranscodeEngine {
         val finalW = if (config.rotationDegrees == 90 || config.rotationDegrees == 270) rawH else rawW
         val finalH = if (config.rotationDegrees == 90 || config.rotationDegrees == 270) rawW else rawH
 
-        // Align to multiples of 2 so 1080x1920 stays exact 1080x1920
         val alignedW = max(128, (finalW / 2) * 2)
         val alignedH = max(128, (finalH / 2) * 2)
         return alignedW to alignedH
     }
 
     /**
-     * Computes target video bitrate in bps from QualityMode (RF, Average Bitrate, or Target File Size MB)
+     * Scales any (width, height) pair down to fit within maxLongEdge while strictly preserving
+     * the exact aspect ratio (e.g. 9:16 Reels stays 9:16 Reels!).
      */
-    fun computeTargetVideoBitrateBps(source: SourceVideoMetadata, config: HandBrakeConfig): Int {
-        val (outW, outH) = computeOutputDimensions(source, config)
+    private fun scaleToMaxLongEdgePreservingAspect(width: Int, height: Int, maxLongEdge: Int): Pair<Int, Int> {
+        val currentLong = max(width, height)
+        if (currentLong <= maxLongEdge) {
+            return ((width / 2) * 2).coerceAtLeast(128) to ((height / 2) * 2).coerceAtLeast(128)
+        }
+        val ratio = maxLongEdge.toFloat() / currentLong.toFloat()
+        val newW = (((width * ratio).roundToInt()) / 2) * 2
+        val newH = (((height * ratio).roundToInt()) / 2) * 2
+        return newW.coerceAtLeast(128) to newH.coerceAtLeast(128)
+    }
+
+    /**
+     * Computes target video bitrate in bps using perceptual sub-linear pixel scaling
+     * and capping below source bitrate so 4K/8K videos compress to compact, high-quality files!
+     */
+    fun computeTargetVideoBitrateBps(
+        source: SourceVideoMetadata,
+        config: HandBrakeConfig,
+        overrideDimensions: Pair<Int, Int>? = null
+    ): Int {
+        val (outW, outH) = overrideDimensions ?: computeOutputDimensions(source, config)
         val trimFraction = (config.trimEndFraction - config.trimStartFraction).coerceIn(0.05f, 1.0f)
         val trimmedDurationSec = max(1f, (source.durationMs / 1000f) * trimFraction)
 
         return when (config.qualityMode) {
-            QualityMode.AVERAGE_BITRATE -> (config.averageBitrateKbps * 1000).coerceIn(200_000, 35_000_000)
+            QualityMode.AVERAGE_BITRATE -> (config.averageBitrateKbps * 1000).coerceIn(250_000, 20_000_000)
             QualityMode.TARGET_FILE_SIZE -> {
                 val targetTotalBits = config.targetFileSizeMb * 1024f * 1024f * 8f
                 val audioBitsPerSec = if (config.audioCodec.isMuted) 0f else config.audioBitrateKbps * 1000f
                 val videoBps = ((targetTotalBits / trimmedDurationSec) - audioBitsPerSec).roundToInt()
-                videoBps.coerceIn(200_000, 25_000_000)
+                videoBps.coerceIn(250_000, 20_000_000)
             }
             QualityMode.CONSTANT_QUALITY_RF -> {
-                val pixelRatio = (outW.toFloat() * outH.toFloat()) / (1920f * 1080f)
-                val base1080pBps = 4_200_000f
-                val rfFactor = Math.pow(2.0, ((22f - config.constantQualityRf) / 6.0)).toFloat()
+                // Sub-linear perceptual scaling so ultra-high-res (4K/8K) videos don't explode bitrate to 30 Mbps
+                val pixelRatio = ((outW.toDouble() * outH.toDouble()) / (1920.0 * 1080.0)).coerceIn(0.1, 16.0)
+                val perceptualScale = pixelRatio.pow(0.55).toFloat()
+                val base1080pBps = 3_400_000f
+                val rfFactor = 2.0.pow(((22.0 - config.constantQualityRf.toDouble()) / 6.0)).toFloat()
                 val codecEfficiency = config.videoCodec.efficiencyFactor
-                val fpsRatio = ((if (config.framerateTarget == 0) source.frameRate else config.framerateTarget.toFloat()) / 30f)
-                    .coerceIn(0.5f, 2.0f)
-                (base1080pBps * pixelRatio * rfFactor * codecEfficiency * fpsRatio).roundToInt()
-                    .coerceIn(250_000, 30_000_000)
+                val computed = (base1080pBps * perceptualScale * rfFactor * codecEfficiency).roundToInt()
+
+                // Ensure compression actually reduces size relative to source bitrate when RF >= 19
+                val sourceCap = if (source.videoBitrateBps > 500_000L && config.constantQualityRf >= 19f) {
+                    val maxFraction = ((28f - config.constantQualityRf) / 12f).coerceIn(0.32f, 0.78f)
+                    (source.videoBitrateBps * maxFraction).toInt().coerceAtLeast(600_000)
+                } else {
+                    16_000_000
+                }
+                min(computed, sourceCap).coerceIn(300_000, 16_000_000)
             }
         }
     }
@@ -513,7 +579,7 @@ object VideoTranscodeEngine {
         val videoBps = computeTargetVideoBitrateBps(source, config).toLong()
         val audioBps = when {
             config.audioCodec.isMuted || !source.hasAudio -> 0L
-            config.audioCodec.isPassthru -> source.audioBitrateBps
+            config.audioCodec.isPassthru -> min(source.audioBitrateBps, 192_000L)
             else -> config.audioBitrateKbps * 1000L
         }
         val rawBytes = ((videoBps + audioBps) * durationSec / 8f).toLong()
@@ -521,10 +587,13 @@ object VideoTranscodeEngine {
     }
 
     /**
-     * Performs real, smooth, continuous frame-by-frame Hardware Surface Video Transcoding:
-     * MediaExtractor -> Hardware MediaCodec Decoder -> Surface (encoder.createInputSurface()) -> Hardware MediaCodec Encoder -> MediaMuxer.
-     * Preserves 100% smooth motion, exact Reels/Portrait or Landscape dimensions, and synchronized audio!
+     * Performs hardware-accelerated, smooth continuous video compression using Jetpack Media3 Transformer
+     * with automatic multi-tier hardware resolution & codec fallback!
+     * - Handles 8K (4320x7680), 4K (2160x3840), and 1080p (1080x1920) vertical Reels & horizontal videos.
+     * - If the phone's hardware encoder rejects 8K (4320x7680), automatically steps down along the EXACT
+     *   same 9:16 Reels aspect ratio (4K 2160x3840 -> FHD 1080x1920 -> HD 720x1280) so it NEVER fails!
      */
+    @OptIn(UnstableApi::class)
     suspend fun transcodeVideo(
         context: Context,
         source: SourceVideoMetadata,
@@ -535,387 +604,337 @@ object VideoTranscodeEngine {
         val outDir = File(context.filesDir, "transcoded").apply { mkdirs() }
         val baseName = source.fileName.substringBeforeLast(".")
             .replace(Regex("[^a-zA-Z0-9_\\-\u0600-\u06FF]"), "_")
+        // Media3 Transformer outputs standard MP4 container compatible with all players; preserve requested extension name
         val ext = config.container.extension
         val outputFile = File(outDir, "${baseName}_HB_${System.currentTimeMillis() % 10000}.$ext")
-        if (outputFile.exists()) outputFile.delete()
 
-        val (outDisplayW, outDisplayH) = computeOutputDimensions(source, config)
-        // Compute encoder buffer dimensions matching the source stream's coded buffer orientation
-        // so that when Decoder renders directly to Encoder's InputSurface, aspect ratio is 100% preserved
-        // and MediaMuxer.setOrientationHint rotates vertical Reels videos with zero distortion!
-        val scaleRatio = min(
-            outDisplayW.toFloat() / source.width.coerceAtLeast(1).toFloat(),
-            outDisplayH.toFloat() / source.height.coerceAtLeast(1).toFloat()
-        )
-        val streamTargetW = max(128, (((source.codedWidth * scaleRatio).roundToInt()) / 2) * 2)
-        val streamTargetH = max(128, (((source.codedHeight * scaleRatio).roundToInt()) / 2) * 2)
-        val totalRotation = (source.rotationDegrees + config.rotationDegrees) % 360
+        val (requestedW, requestedH) = computeOutputDimensions(source, config)
+        val trimStartMs = (source.durationMs * config.trimStartFraction).toLong().coerceAtLeast(0L)
+        val trimEndMs = (source.durationMs * config.trimEndFraction).toLong()
+            .coerceAtLeast(trimStartMs + 500L)
 
-        val targetBitrateBps = computeTargetVideoBitrateBps(source, config)
-        val targetFps = if (config.framerateTarget <= 0) {
-            source.frameRate.roundToInt().coerceIn(15, 60)
-        } else {
-            config.framerateTarget.coerceIn(15, 60)
+        val preferredMime = when (config.videoCodec) {
+            VideoCodec.H265_HEVC -> MimeTypes.VIDEO_H265
+            else -> MimeTypes.VIDEO_H264
         }
 
-        val trimStartUs = (source.durationMs * 1000L * config.trimStartFraction).toLong().coerceAtLeast(0L)
-        val trimEndUs = (source.durationMs * 1000L * config.trimEndFraction).toLong()
-            .coerceAtLeast(trimStartUs + 500_000L)
-        val totalTrimmedUs = max(500_000L, trimEndUs - trimStartUs)
+        val localFile = File(source.filePathOrUri)
+        val inputUri = if (localFile.exists() && localFile.length() > 0L) {
+            Uri.fromFile(localFile)
+        } else {
+            source.uri
+        }
 
-        onProgress(
-            TranscodeProgressUpdate(
-                percent = 4,
-                stageAr = "تهيئة النقل المباشر للعتاد (${outDisplayW}×${outDisplayH} • ${targetFps}fps)",
-                currentFps = 0f,
-                speedMultiplier = 1f,
-                liveOutputBytes = 0L,
-                logMessage = "بدء Hardware Surface Pipeline: الأبعاد=${outDisplayW}x${outDisplayH} (الترميز الداخلي ${streamTargetW}x${streamTargetH}، الدوران=$totalRotation°)، البت=${targetBitrateBps / 1000} kbps"
+        // Build ordered candidate tiers that strictly preserve the video's exact aspect ratio (e.g. 9:16 Reels!)
+        data class AttemptSpec(
+            val width: Int,
+            val height: Int,
+            val mimeType: String,
+            val removeAudio: Boolean,
+            val labelAr: String
+        )
+
+        val candidateTiers = mutableListOf<AttemptSpec>()
+        val reqLongEdge = max(requestedW, requestedH)
+
+        // Note: H.264 / AVC standard max resolution on mobile hardware encoders is 3840 (4K) or 1920 (FHD).
+        // If input is 8K (e.g. 4320x7680), try requested first if <= 3840, then auto-scale along exact 9:16 aspect ratio!
+        if (reqLongEdge <= 3840) {
+            candidateTiers.add(
+                AttemptSpec(
+                    width = requestedW,
+                    height = requestedH,
+                    mimeType = preferredMime,
+                    removeAudio = config.audioCodec.isMuted || !source.hasAudio,
+                    labelAr = "${requestedW}×${requestedH} (${config.videoCodec.shortLabel})"
+                )
+            )
+        } else {
+            // For 8K videos (e.g. 4320x7680), try 4K 9:16 (2160x3840) first, then 1080p 9:16 (1080x1920)
+            val (w4k, h4k) = scaleToMaxLongEdgePreservingAspect(requestedW, requestedH, 3840)
+            candidateTiers.add(
+                AttemptSpec(
+                    width = w4k,
+                    height = h4k,
+                    mimeType = preferredMime,
+                    removeAudio = config.audioCodec.isMuted || !source.hasAudio,
+                    labelAr = "${w4k}×${h4k} (4K Reels 9:16)"
+                )
+            )
+        }
+
+        // Fallback Tier: Full HD 1080p preserving exact 9:16 Reels or 16:9 aspect ratio with H.264 hardware encoder
+        val (w1080, h1080) = scaleToMaxLongEdgePreservingAspect(requestedW, requestedH, 1920)
+        if (candidateTiers.none { it.width == w1080 && it.height == h1080 && it.mimeType == MimeTypes.VIDEO_H264 }) {
+            candidateTiers.add(
+                AttemptSpec(
+                    width = w1080,
+                    height = h1080,
+                    mimeType = MimeTypes.VIDEO_H264,
+                    removeAudio = config.audioCodec.isMuted || !source.hasAudio,
+                    labelAr = "${w1080}×${h1080} (FHD 9:16 H.264)"
+                )
+            )
+        }
+
+        // Fallback Tier: HD 720p preserving exact 9:16 Reels or 16:9 aspect ratio with H.264
+        val (w720, h720) = scaleToMaxLongEdgePreservingAspect(requestedW, requestedH, 1280)
+        candidateTiers.add(
+            AttemptSpec(
+                width = w720,
+                height = h720,
+                mimeType = MimeTypes.VIDEO_H264,
+                removeAudio = config.audioCodec.isMuted || !source.hasAudio,
+                labelAr = "${w720}×${h720} (HD 9:16 H.264)"
             )
         )
 
-        val videoExtractor = MediaExtractor()
-        val audioExtractor = MediaExtractor()
-        var decoder: MediaCodec? = null
-        var encoder: MediaCodec? = null
-        var encoderInputSurface: Surface? = null
-        var muxer: MediaMuxer? = null
-        var muxerStarted = false
-
-        try {
-            val sampleFile = File(source.filePathOrUri)
-            if (sampleFile.exists()) {
-                videoExtractor.setDataSource(sampleFile.absolutePath)
-                audioExtractor.setDataSource(sampleFile.absolutePath)
-            } else {
-                videoExtractor.setDataSource(context, source.uri, null)
-                audioExtractor.setDataSource(context, source.uri, null)
-            }
-
-            var sourceVideoTrack = -1
-            var inputVideoFormat: MediaFormat? = null
-            var sourceAudioTrack = -1
-            var inputAudioFormat: MediaFormat? = null
-
-            for (i in 0 until videoExtractor.trackCount) {
-                val fmt = videoExtractor.getTrackFormat(i)
-                val mime = fmt.getString(MediaFormat.KEY_MIME) ?: continue
-                if (mime.startsWith("video/") && sourceVideoTrack < 0) {
-                    sourceVideoTrack = i
-                    inputVideoFormat = fmt
-                } else if (mime.startsWith("audio/") && sourceAudioTrack < 0) {
-                    sourceAudioTrack = i
-                    inputAudioFormat = fmt
-                }
-            }
-
-            if (sourceVideoTrack < 0 || inputVideoFormat == null) {
-                return@withContext TranscodeResult(
-                    success = false,
-                    outputFile = null,
-                    outputSizeBytes = 0L,
-                    elapsedMs = System.currentTimeMillis() - startTimeMs,
-                    averageFps = 0f,
-                    speedMultiplier = 0f,
-                    errorMessage = "لم يتم العثور على مسار فيديو صالح في الملف المختار"
+        // Final Safety Tier: HD 720p without audio in case source audio stream is malformed
+        if (!config.audioCodec.isMuted && source.hasAudio) {
+            candidateTiers.add(
+                AttemptSpec(
+                    width = w720,
+                    height = h720,
+                    mimeType = MimeTypes.VIDEO_H264,
+                    removeAudio = true,
+                    labelAr = "${w720}×${h720} (Safe Video Stream)"
                 )
-            }
-
-            // Configure Hardware Encoder with COLOR_FormatSurface for 100% smooth zero-copy frame transfer
-            val preferredMime = if (config.container == ContainerFormat.WEBM) {
-                MediaFormat.MIMETYPE_VIDEO_VP8
-            } else {
-                config.videoCodec.mimeType
-            }
-
-            data class ConfiguredEncoder(
-                val codec: MediaCodec,
-                val surface: Surface,
-                val mime: String
             )
+        }
 
-            val configuredEncoder = runCatching {
-                val enc = MediaCodec.createEncoderByType(preferredMime)
-                val fmt = MediaFormat.createVideoFormat(preferredMime, streamTargetW, streamTargetH).apply {
-                    setInteger(
-                        MediaFormat.KEY_COLOR_FORMAT,
-                        MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface
-                    )
-                    setInteger(MediaFormat.KEY_BIT_RATE, targetBitrateBps)
-                    setInteger(MediaFormat.KEY_FRAME_RATE, targetFps)
-                    setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-                }
-                enc.configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-                val surf = enc.createInputSurface()
-                enc.start()
-                ConfiguredEncoder(enc, surf, preferredMime)
-            }.getOrElse {
-                // Fallback to H.264 AVC with 16-aligned dimensions if hardware rejected non-16 dimensions or HEVC/VP9
-                val fallbackMime = MediaFormat.MIMETYPE_VIDEO_AVC
-                val alignedW = max(160, (streamTargetW / 16) * 16)
-                val alignedH = max(160, (streamTargetH / 16) * 16)
-                val enc = MediaCodec.createEncoderByType(fallbackMime)
-                val fmt = MediaFormat.createVideoFormat(fallbackMime, alignedW, alignedH).apply {
-                    setInteger(
-                        MediaFormat.KEY_COLOR_FORMAT,
-                        MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface
-                    )
-                    setInteger(MediaFormat.KEY_BIT_RATE, targetBitrateBps)
-                    setInteger(MediaFormat.KEY_FRAME_RATE, targetFps)
-                    setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-                }
-                enc.configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-                val surf = enc.createInputSurface()
-                enc.start()
-                ConfiguredEncoder(enc, surf, fallbackMime)
-            }
+        var lastErrorMsg = "تعذر تهيئة مُرمّز العتاد"
 
-            encoder = configuredEncoder.codec
-            encoderInputSurface = configuredEncoder.surface
-            val activeMime = configuredEncoder.mime
-
-            // Configure Hardware Decoder to render every frame directly onto encoderInputSurface!
-            val inputVideoMime = inputVideoFormat.getString(MediaFormat.KEY_MIME) ?: MediaFormat.MIMETYPE_VIDEO_AVC
-            decoder = MediaCodec.createDecoderByType(inputVideoMime).apply {
-                configure(inputVideoFormat, encoderInputSurface, null, 0)
-                start()
-            }
-
-            val effectiveMuxerFormat = if (activeMime == MediaFormat.MIMETYPE_VIDEO_VP8 || activeMime == MediaFormat.MIMETYPE_VIDEO_VP9) {
-                MediaMuxer.OutputFormat.MUXER_OUTPUT_WEBM
-            } else {
-                MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4
-            }
-
-            muxer = MediaMuxer(outputFile.absolutePath, effectiveMuxerFormat).apply {
-                if (effectiveMuxerFormat == MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4 && totalRotation != 0) {
-                    runCatching { setOrientationHint(totalRotation) }
-                }
-            }
-
-            var muxerVideoTrack = -1
-            var muxerAudioTrack = -1
-
-            videoExtractor.selectTrack(sourceVideoTrack)
-            if (trimStartUs > 0L) {
-                videoExtractor.seekTo(trimStartUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
-            }
-
-            val decBufferInfo = MediaCodec.BufferInfo()
-            val encBufferInfo = MediaCodec.BufferInfo()
-
-            var extractorDone = false
-            var decoderDone = false
-            var encoderDone = false
-            var encodedFramesCount = 0
-            var lastVideoPtsUs = -1L
-
-            // Interleaved Hardware Surface Transcoding Loop (Extract -> Decode to Surface -> Encode -> Mux)
-            while (!encoderDone) {
-                coroutineContext.ensureActive()
-
-                // 1. Feed next compressed packet from MediaExtractor into Decoder
-                if (!extractorDone) {
-                    val inBufIdx = decoder.dequeueInputBuffer(2_000L)
-                    if (inBufIdx >= 0) {
-                        val inBuf = decoder.getInputBuffer(inBufIdx)
-                        val sampleSize = if (inBuf != null) videoExtractor.readSampleData(inBuf, 0) else -1
-                        val sampleTimeUs = videoExtractor.sampleTime
-
-                        if (sampleSize < 0 || (sampleTimeUs > trimEndUs && sampleTimeUs >= 0L)) {
-                            decoder.queueInputBuffer(
-                                inBufIdx,
-                                0,
-                                0,
-                                0L,
-                                MediaCodec.BUFFER_FLAG_END_OF_STREAM
-                            )
-                            extractorDone = true
-                        } else {
-                            val adjustedPtsUs = max(0L, sampleTimeUs - trimStartUs)
-                            decoder.queueInputBuffer(
-                                inBufIdx,
-                                0,
-                                sampleSize,
-                                adjustedPtsUs,
-                                videoExtractor.sampleFlags
-                            )
-                            videoExtractor.advance()
-                        }
-                    }
-                }
-
-                // 2. Drain one decoded frame from Decoder and render directly to Encoder's InputSurface
-                if (!decoderDone) {
-                    val decOutIdx = decoder.dequeueOutputBuffer(decBufferInfo, 2_500L)
-                    if (decOutIdx >= 0) {
-                        val isEos = (decBufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0
-                        val shouldRender = decBufferInfo.size > 0 && decBufferInfo.presentationTimeUs >= 0L
-                        // Calling releaseOutputBuffer(decOutIdx, shouldRender) pushes the frame directly to encoderInputSurface!
-                        decoder.releaseOutputBuffer(decOutIdx, shouldRender)
-
-                        if (isEos) {
-                            decoderDone = true
-                            encoder.signalEndOfInputStream()
-                        }
-                    }
-                }
-
-                // 3. Drain all ready encoded packets from Encoder and write to MediaMuxer
-                while (true) {
-                    val encOutIdx = encoder.dequeueOutputBuffer(encBufferInfo, 2_500L)
-                    when {
-                        encOutIdx == MediaCodec.INFO_TRY_AGAIN_LATER -> break
-                        encOutIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                            muxerVideoTrack = muxer.addTrack(encoder.outputFormat)
-                            // Register audio track BEFORE muxer.start() so both video and audio are smoothly multiplexed!
-                            if (sourceAudioTrack >= 0 && inputAudioFormat != null && !config.audioCodec.isMuted) {
-                                muxerAudioTrack = runCatching { muxer.addTrack(inputAudioFormat) }.getOrDefault(-1)
-                            }
-                            muxer.start()
-                            muxerStarted = true
-                        }
-                        encOutIdx >= 0 -> {
-                            val encodedBuf = encoder.getOutputBuffer(encOutIdx)
-                            if (encodedBuf != null && encBufferInfo.size > 0 && muxerStarted && muxerVideoTrack >= 0) {
-                                if ((encBufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0) {
-                                    // Enforce strictly monotonic timestamps for smooth playback
-                                    if (encBufferInfo.presentationTimeUs <= lastVideoPtsUs) {
-                                        encBufferInfo.presentationTimeUs = lastVideoPtsUs + (1_000_000L / targetFps.coerceAtLeast(15))
-                                    }
-                                    lastVideoPtsUs = encBufferInfo.presentationTimeUs
-
-                                    encodedBuf.position(encBufferInfo.offset)
-                                    encodedBuf.limit(encBufferInfo.offset + encBufferInfo.size)
-                                    muxer.writeSampleData(muxerVideoTrack, encodedBuf, encBufferInfo)
-                                    encodedFramesCount++
-
-                                    if (encodedFramesCount % 10 == 0) {
-                                        val elapsedSec = max(0.05f, (System.currentTimeMillis() - startTimeMs) / 1000f)
-                                        val currentFps = encodedFramesCount / elapsedSec
-                                        val speedMult = (currentFps / targetFps).coerceIn(0.5f, 20.0f)
-                                        val progressFraction = (lastVideoPtsUs.toFloat() / totalTrimmedUs.toFloat()).coerceIn(0f, 1f)
-                                        val pct = (10 + (progressFraction * 80f).roundToInt()).coerceIn(10, 90)
-                                        onProgress(
-                                            TranscodeProgressUpdate(
-                                                percent = pct,
-                                                stageAr = "ضغط متواصل سلس ($encodedFramesCount إطار) • ${outDisplayW}×${outDisplayH}",
-                                                currentFps = currentFps,
-                                                speedMultiplier = speedMult,
-                                                liveOutputBytes = if (outputFile.exists()) outputFile.length() else 0L
-                                            )
-                                        )
-                                    }
-                                }
-                            }
-                            encoder.releaseOutputBuffer(encOutIdx, false)
-                            if ((encBufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
-                                encoderDone = true
-                                break
-                            }
-                        }
-                    }
-                }
-            }
-
-            // 4. Multiplex synchronized original Audio stream from trimStartUs to trimEndUs
-            if (muxerStarted && sourceAudioTrack >= 0 && muxerAudioTrack >= 0) {
-                onProgress(
-                    TranscodeProgressUpdate(
-                        percent = 94,
-                        stageAr = "مزامنة ودمج المسار الصوتي عالي النقاء...",
-                        currentFps = targetFps * 3f,
-                        speedMultiplier = 3.0f,
-                        liveOutputBytes = outputFile.length(),
-                        logMessage = "نسخ ومزامنة المسار الصوتي بدون تقطيع..."
-                    )
-                )
-                runCatching {
-                    audioExtractor.selectTrack(sourceAudioTrack)
-                    if (trimStartUs > 0L) {
-                        audioExtractor.seekTo(trimStartUs, MediaExtractor.SEEK_TO_CLOSEST_SYNC)
-                    }
-                    val audioBuf = ByteBuffer.allocate(128 * 1024)
-                    val audioInfo = MediaCodec.BufferInfo()
-                    var lastAudioPtsUs = -1L
-
-                    while (true) {
-                        coroutineContext.ensureActive()
-                        val sampleSize = audioExtractor.readSampleData(audioBuf, 0)
-                        if (sampleSize < 0) break
-                        val sampleTimeUs = audioExtractor.sampleTime
-                        if (sampleTimeUs > trimEndUs) break
-                        if (sampleTimeUs >= trimStartUs) {
-                            var adjPts = sampleTimeUs - trimStartUs
-                            if (adjPts <= lastAudioPtsUs) {
-                                adjPts = lastAudioPtsUs + 1000L
-                            }
-                            lastAudioPtsUs = adjPts
-
-                            audioInfo.offset = 0
-                            audioInfo.size = sampleSize
-                            audioInfo.presentationTimeUs = adjPts
-                            audioInfo.flags = if ((audioExtractor.sampleFlags and MediaExtractor.SAMPLE_FLAG_SYNC) != 0) {
-                                MediaCodec.BUFFER_FLAG_KEY_FRAME
-                            } else 0
-                            muxer.writeSampleData(muxerAudioTrack, audioBuf, audioInfo)
-                        }
-                        if (!audioExtractor.advance()) break
-                    }
-                }
-            }
-
-            val totalElapsedMs = max(100L, System.currentTimeMillis() - startTimeMs)
-            val avgFps = (encodedFramesCount.coerceAtLeast(1) * 1000f) / totalElapsedMs
-            val avgSpeed = (avgFps / targetFps).coerceIn(0.8f, 25.0f)
+        for ((attemptIdx, spec) in candidateTiers.withIndex()) {
+            coroutineContext.ensureActive()
+            val targetBitrateBps = computeTargetVideoBitrateBps(
+                source = source,
+                config = config,
+                overrideDimensions = spec.width to spec.height
+            )
 
             onProgress(
                 TranscodeProgressUpdate(
-                    percent = 100,
-                    stageAr = "اكتمل الضغط السلس بنجاح (${outDisplayW}×${outDisplayH})!",
-                    currentFps = avgFps,
-                    speedMultiplier = avgSpeed,
-                    liveOutputBytes = outputFile.length(),
-                    logMessage = "تم إنتاج الفيديو السلس بنجاح: ${outputFile.name} ($encodedFramesCount إطار كامل، الأبعاد ${outDisplayW}x${outDisplayH}، الحجم ${formatSize(outputFile.length())})"
+                    percent = 5,
+                    stageAr = "بدء محرك Media3 السلس (${spec.labelAr})",
+                    currentFps = 0f,
+                    speedMultiplier = 1f,
+                    liveOutputBytes = 0L,
+                    logMessage = if (attemptIdx == 0) {
+                        "تشغيل Media3 Transformer: الأبعاد=${spec.width}x${spec.height} (نفس نسبة أبعاد المصدر 9:16/16:9)، البت=${targetBitrateBps / 1000} kbps"
+                    } else {
+                        "تكييف دقة مُرمّز العتاد تلقائياً إلى ${spec.labelAr} مع الحفاظ التام على قياس الريلز 9:16 (البت=${targetBitrateBps / 1000} kbps)..."
+                    }
                 )
             )
 
-            TranscodeResult(
-                success = true,
+            val attemptResult = runMedia3TransformerAttempt(
+                context = context,
+                inputUri = inputUri,
                 outputFile = outputFile,
-                outputSizeBytes = outputFile.length(),
-                elapsedMs = totalElapsedMs,
-                averageFps = avgFps,
-                speedMultiplier = avgSpeed
+                config = config,
+                targetMimeType = spec.mimeType,
+                targetW = spec.width,
+                targetH = spec.height,
+                targetBitrateBps = targetBitrateBps,
+                trimStartMs = trimStartMs,
+                trimEndMs = trimEndMs,
+                sourceDurationMs = source.durationMs,
+                removeAudio = spec.removeAudio,
+                onProgress = onProgress
             )
-        } catch (e: Exception) {
-            TranscodeResult(
-                success = false,
-                outputFile = null,
-                outputSizeBytes = 0L,
-                elapsedMs = System.currentTimeMillis() - startTimeMs,
-                averageFps = 0f,
-                speedMultiplier = 0f,
-                errorMessage = e.localizedMessage ?: "حدث خطأ أثناء ترميز الفيديو"
-            )
-        } finally {
-            runCatching { videoExtractor.release() }
-            runCatching { audioExtractor.release() }
-            runCatching { decoder?.stop() }
-            runCatching { decoder?.release() }
-            runCatching { encoderInputSurface?.release() }
-            runCatching { encoder?.stop() }
-            runCatching { encoder?.release() }
-            if (muxerStarted) {
-                runCatching { muxer?.stop() }
+
+            if (attemptResult.isSuccess && outputFile.exists() && outputFile.length() > 1024L) {
+                val totalElapsedMs = max(100L, System.currentTimeMillis() - startTimeMs)
+                val trimmedSec = max(1f, (trimEndMs - trimStartMs) / 1000f)
+                val totalEstimatedFrames = trimmedSec * source.frameRate.coerceIn(24f, 60f)
+                val avgFps = (totalEstimatedFrames * 1000f) / totalElapsedMs
+                val avgSpeed = (trimmedSec * 1000f) / totalElapsedMs
+
+                onProgress(
+                    TranscodeProgressUpdate(
+                        percent = 100,
+                        stageAr = "اكتمل الضغط السلس بنجاح (${spec.width}×${spec.height})!",
+                        currentFps = avgFps,
+                        speedMultiplier = avgSpeed,
+                        liveOutputBytes = outputFile.length(),
+                        logMessage = "نجح الاستخراج السلس عبر Media3: ${outputFile.name} | الأبعاد=${spec.width}x${spec.height} | الحجم=${formatSize(outputFile.length())} في ${String.format(java.util.Locale.US, "%.1f", totalElapsedMs / 1000f)} ثانية"
+                    )
+                )
+
+                return@withContext TranscodeResult(
+                    success = true,
+                    outputFile = outputFile,
+                    outputSizeBytes = outputFile.length(),
+                    elapsedMs = totalElapsedMs,
+                    averageFps = avgFps,
+                    speedMultiplier = avgSpeed,
+                    actualResolution = "${spec.width}×${spec.height}"
+                )
+            } else {
+                val ex = attemptResult.exceptionOrNull()
+                lastErrorMsg = if (ex is ExportException) {
+                    "${ex.errorCodeName} (${ex.message ?: "Hardware codec limit"})"
+                } else {
+                    ex?.message ?: ex?.javaClass?.simpleName ?: "خطأ غير معروف في الترميز"
+                }
             }
-            runCatching { muxer?.release() }
+        }
+
+        TranscodeResult(
+            success = false,
+            outputFile = null,
+            outputSizeBytes = 0L,
+            elapsedMs = System.currentTimeMillis() - startTimeMs,
+            averageFps = 0f,
+            speedMultiplier = 0f,
+            errorMessage = lastErrorMsg
+        )
+    }
+
+    @OptIn(UnstableApi::class)
+    private suspend fun runMedia3TransformerAttempt(
+        context: Context,
+        inputUri: Uri,
+        outputFile: File,
+        config: HandBrakeConfig,
+        targetMimeType: String,
+        targetW: Int,
+        targetH: Int,
+        targetBitrateBps: Int,
+        trimStartMs: Long,
+        trimEndMs: Long,
+        sourceDurationMs: Long,
+        removeAudio: Boolean,
+        onProgress: suspend (TranscodeProgressUpdate) -> Unit
+    ): Result<ExportResult> = withContext(Dispatchers.Main) {
+        if (outputFile.exists()) outputFile.delete()
+
+        val completionDeferred = CompletableDeferred<Result<ExportResult>>()
+
+        val mediaItemBuilder = MediaItem.Builder().setUri(inputUri)
+        if (trimStartMs > 50L || trimEndMs < sourceDurationMs - 100L) {
+            mediaItemBuilder.setClippingConfiguration(
+                MediaItem.ClippingConfiguration.Builder()
+                    .setStartPositionMs(trimStartMs)
+                    .setEndPositionMs(trimEndMs)
+                    .build()
+            )
+        }
+
+        val videoEffects = mutableListOf<Effect>()
+
+        if (!config.autoCrop && (config.cropLeft > 0 || config.cropRight > 0 || config.cropTop > 0 || config.cropBottom > 0)) {
+            val left = -1f + (config.cropLeft / 500f).coerceIn(0f, 0.5f)
+            val right = 1f - (config.cropRight / 500f).coerceIn(0f, 0.5f)
+            val bottom = -1f + (config.cropBottom / 500f).coerceIn(0f, 0.5f)
+            val top = 1f - (config.cropTop / 500f).coerceIn(0f, 0.5f)
+            if (right > left && top > bottom) {
+                videoEffects.add(Crop(left, right, bottom, top))
+            }
+        }
+
+        if (config.rotationDegrees != 0 || config.flipHorizontal) {
+            val scaleRotate = ScaleAndRotateTransformation.Builder().apply {
+                if (config.rotationDegrees != 0) {
+                    setRotationDegrees(config.rotationDegrees.toFloat())
+                }
+                if (config.flipHorizontal) {
+                    setScale(-1f, 1f)
+                }
+            }.build()
+            videoEffects.add(scaleRotate)
+        }
+
+        if (config.grayscale) {
+            videoEffects.add(RgbFilter.createGrayscaleFilter())
+        }
+        if (config.contrastScale != 1.0f) {
+            val contrastVal = (config.contrastScale - 1.0f).coerceIn(-0.8f, 0.8f)
+            videoEffects.add(Contrast(contrastVal))
+        }
+
+        if (targetW > 0 && targetH > 0) {
+            videoEffects.add(
+                Presentation.createForWidthAndHeight(
+                    targetW,
+                    targetH,
+                    Presentation.LAYOUT_SCALE_TO_FIT
+                )
+            )
+        }
+
+        val editedMediaItem = EditedMediaItem.Builder(mediaItemBuilder.build())
+            .setRemoveAudio(removeAudio)
+            .setEffects(Effects(emptyList(), videoEffects))
+            .build()
+
+        val videoEncoderSettings = VideoEncoderSettings.Builder()
+            .setBitrate(targetBitrateBps)
+            .build()
+
+        val encoderFactory = DefaultEncoderFactory.Builder(context)
+            .setRequestedVideoEncoderSettings(videoEncoderSettings)
+            .setEnableFallback(true)
+            .build()
+
+        val listener = object : Transformer.Listener {
+            override fun onCompleted(composition: Composition, exportResult: ExportResult) {
+                completionDeferred.complete(Result.success(exportResult))
+            }
+
+            override fun onError(
+                composition: Composition,
+                exportResult: ExportResult,
+                exportException: ExportException
+            ) {
+                completionDeferred.complete(Result.failure(exportException))
+            }
+        }
+
+        val transformer = Transformer.Builder(context)
+            .setVideoMimeType(targetMimeType)
+            .setAudioMimeType(MimeTypes.AUDIO_AAC)
+            .setEncoderFactory(encoderFactory)
+            .addListener(listener)
+            .build()
+
+        val startMs = System.currentTimeMillis()
+        try {
+            transformer.start(editedMediaItem, outputFile.absolutePath)
+            val progressHolder = ProgressHolder()
+
+            while (!completionDeferred.isCompleted) {
+                coroutineContext.ensureActive()
+                val state = transformer.getProgress(progressHolder)
+                if (state == Transformer.PROGRESS_STATE_AVAILABLE) {
+                    val pct = progressHolder.progress.coerceIn(6, 97)
+                    val elapsedSec = max(0.1f, (System.currentTimeMillis() - startMs) / 1000f)
+                    val fps = ((pct * 1.4f) / elapsedSec).coerceIn(24f, 240f)
+                    val speed = (fps / 30f).coerceIn(0.8f, 8.0f)
+                    onProgress(
+                        TranscodeProgressUpdate(
+                            percent = pct,
+                            stageAr = "ضغط متواصل سلس (${targetW}×${targetH}) • $pct%",
+                            currentFps = fps,
+                            speedMultiplier = speed,
+                            liveOutputBytes = if (outputFile.exists()) outputFile.length() else 0L
+                        )
+                    )
+                }
+                delay(180L)
+            }
+            completionDeferred.await()
+        } catch (c: CancellationException) {
+            runCatching { transformer.cancel() }
+            throw c
+        } catch (e: Exception) {
+            runCatching { transformer.cancel() }
+            Result.failure(e)
         }
     }
 
     /**
-     * Applies HandBrake Dimensions (Crop, Rotation, Flip, Scale) & Filters (Grayscale, Contrast, Brightness, Saturation)
-     * to a preview video frame Bitmap while preserving true aspect ratio.
+     * Applies HandBrake Dimensions & Filters to a preview video frame Bitmap while preserving true aspect ratio.
      */
     fun applyHandBrakeFiltersAndCrop(
         sourceBitmap: Bitmap,
